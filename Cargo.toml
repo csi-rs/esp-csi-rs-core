@@ -1,6 +1,6 @@
 [package]
 name = "esp-csi-rs-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["theembeddedrustacean", "stacks-of-data", "Abdullah-Alawad", "modatt"]
 description = "Shared engine for esp-csi-rs — CSI collection on ESP devices"
