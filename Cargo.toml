@@ -1,0 +1,244 @@
+[package]
+name = "esp-csi-rs-core"
+version = "0.1.0"
+edition = "2024"
+authors = ["theembeddedrustacean", "stacks-of-data", "Abdullah-Alawad", "modatt"]
+description = "Shared engine for esp-csi-rs — CSI collection on ESP devices"
+keywords = ["embedded", "esp32", "wifi", "csi"]
+categories = ["embedded"]
+readme = "README.md"
+homepage = "https://blog.theembeddedrustacean.com/"
+repository = "https://github.com/csi-rs/esp-csi-rs-core"
+license = "MIT OR Apache-2.0"
+exclude = ["target/debug/*", "assets/*"]
+
+[lib]
+path = "src/lib/lib.rs"
+
+[features]
+#! ⚠️ At minimum you are required to choose only ONE of the device options. For the most efficient (and fastest) logging, you should combine defmt with the jtag-serial features.
+
+default = ["no-std", "println", "auto"]
+## Build without the standard library.
+no-std = []
+## Enable logging via `println!()`.
+println = ["dep:log", "esp-backtrace/println"]
+## Automatically select the logging backend at runtime.
+##
+## Runtime behavior (when `async-print` is NOT enabled):
+## - USB SOF detected (USB-Serial-JTAG/JTAG path) -> async logging backend
+## - no USB SOF (UART path) -> sync inline logging
+##
+## Precedence:
+## - `async-print` overrides `auto` and forces async logging.
+## - `jtag-serial` / `uart` force transport selection; `auto` is for runtime
+##   transport selection.
+auto = ["esp-println/auto"]
+## Enable logging via defmt.
+defmt = [
+    "dep:defmt",
+    "esp-hal/defmt",
+    "esp-radio/defmt",
+    "esp-backtrace/defmt",
+    "embassy-executor/defmt",
+]
+## Force the JTAG backend for logging.
+##
+## With `auto` (and without explicit `async-print`), runtime selection enables
+## async drain when USB SOF indicates JTAG/USB-Serial-JTAG is active.
+jtag-serial = ["esp-println/jtag-serial"]
+## Force the UART backend for logging (not recommended, much slower than JTAG backend).
+## Do NOT combine with `async-print`: UART is already blocking and slow, and the async
+## logging path provides no benefit while adding overhead and risk of unexpected behavior.
+uart = ["esp-println/uart"]
+## Disable all logging.
+no-print = ["esp-println/no-op"]
+## Enable collection of runtime statistics (e.g., latency, dropped packets).
+statistics = []
+## Non-blocking async logging override.
+## When enabled explicitly, async logging is forced regardless of runtime backend detection.
+async-print = []
+## Use an external defmt global logger instead of registering one from this crate.
+external-defmt-logger = []
+## Enable esp-rtos scheduler tracing so the CPU-utilization DUT
+## (`esp_now_peripheral_exper_cpu`) can measure absolute idle *time* from
+## `system_idle`/`task_exec_begin` switch hooks (spec v2 §2.2). Only the CPU
+## experiment needs this; it adds a hook call to every context switch.
+cpu-trace = ["dep:rtos-trace", "esp-rtos/rtos-trace"]
+## Expose runtime TX controls (rate / payload / pause) that let the CPU-test
+## TX example (`esp_now_central_exper_cpu_tx`) steer the real `run_esp_now_central`
+## loop from the experiment schedule. Only that example needs it.
+cpu-test-tx = []
+
+## Support for the ESP32
+esp32 = [
+    "esp-backtrace/esp32",
+    "esp-hal/esp32",
+    "esp-hal/rt",
+    "esp-println/esp32",
+    "esp-bootloader-esp-idf/esp32",
+    "esp-println/critical-section",
+    "esp-radio/esp32",
+    "esp-radio/csi",
+    "esp-radio/sniffer",
+    "esp-rtos/esp32",
+]
+
+## Support for the ESP32-C3
+esp32c3 = [
+    "esp-hal/esp32c3",
+    "esp-hal/rt",
+    "esp-backtrace/esp32c3",
+    "esp-radio/esp32c3",
+    "esp-bootloader-esp-idf/esp32c3",
+    "esp-radio/csi",
+    "esp-radio/sniffer",
+    "esp-println/esp32c3",
+    "esp-rtos/esp32c3",
+]
+
+## Support for the ESP32-C6 (WiFi 6)
+esp32c6 = [
+    "esp-hal/esp32c6",
+    "esp-hal/rt",
+    "esp-backtrace/esp32c6",
+    "esp-radio/esp32c6",
+    "esp-bootloader-esp-idf/esp32c6",
+    "esp-radio/csi",
+    "esp-radio/sniffer",
+    "esp-println/esp32c6",
+    "esp-println/critical-section",
+    "esp-rtos/esp32c6",
+]
+
+## Support for the ESP32-S3 (AIoT)
+esp32s3 = [
+    "esp-hal/esp32s3",
+    "esp-hal/rt",
+    "esp-backtrace/esp32s3",
+    "esp-radio/esp32s3",
+    "esp-bootloader-esp-idf/esp32s3",
+    "esp-radio/csi",
+    "esp-radio/sniffer",
+    "esp-println/esp32s3",
+    "esp-println/critical-section",
+    "esp-rtos/esp32s3",
+]
+
+esp32c5 = [
+    "esp-hal/esp32c5",
+    "esp-hal/rt",
+    "esp-backtrace/esp32c5",
+    "esp-radio/esp32c5",
+    "esp-bootloader-esp-idf/esp32c5",
+    "esp-radio/csi",
+    "esp-radio/sniffer",
+    "esp-println/esp32c5",
+    "esp-println/critical-section",
+    "esp-rtos/esp32c5",
+]
+
+
+[dependencies]
+# Core dependencies required for ESP HAL/RTOS, radio, and networking.
+# Core dependencies
+esp-hal = { version = "~1.1", default-features = false, optional = false, features = [
+    "unstable",
+] }
+esp-rtos = { version = "0.3.0", optional = false, features = [
+    "embassy",
+    "esp-alloc",
+    "esp-radio",
+] }
+esp-bootloader-esp-idf = { version = "0.5.0", optional = false, features = [] }
+embassy-net = { version = "0.7.1", features = [
+    "dhcpv4",
+    "medium-ethernet",
+    "tcp",
+    "udp",
+    "raw",
+] }
+embedded-io-async = { version = "0.7.0", optional = false }
+esp-alloc = { version = "0.10.0", optional = false }
+esp-backtrace = { version = "0.19.0", optional = false, features = [
+    "panic-handler",
+] }
+esp-println = { version = "0.17.0", optional = false, default-features = false, features = [
+] }
+embassy-executor = { version = "0.10.0", optional = false }
+embassy-time = { version = "0.5.0", optional = false }
+esp-radio = { version = "0.18.0", default-features = false, optional = false, features = [
+    "wifi",
+    "sniffer",
+    "esp-alloc",
+    "unstable",
+    "esp-now",
+] }
+smoltcp = { version = "0.12.0", default-features = false, features = [
+    "medium-ethernet",
+    "multicast",
+    "proto-dhcpv4",
+    "proto-dns",
+    "proto-ipv4",
+    "socket-dns",
+    "socket-icmp",
+    "socket-raw",
+    "socket-tcp",
+    "socket-udp",
+] }
+heapless = { version = "0.7", default-features = false, optional = false, features = [
+    "serde",
+] }
+embassy-sync = { version = "0.8.0", optional = false }
+enumset = { version = "1.1.5", optional = false }
+embassy-futures = "0.1.2"
+static_cell = "2.1.1"
+
+document-features = "0.2.11"
+
+defmt = { version = "1.0.1", optional = true, features = ["encoding-rzcobs"] }
+
+log = { version = "0.4.29", optional = true }
+
+serde = { version = "1.0.228", default-features = false, features = ["derive"] }
+postcard = { version = "1.1.3", features = ["experimental-derive", "heapless"] }
+
+portable-atomic = { version = "1.13.0", default-features = false }
+
+# Optional: enabled by the `cpu-trace` feature for the CPU-utilization DUT
+# example. Provides the `RtosTrace` trait + `global_trace!` sink that
+# esp-rtos's `rtos-trace` integration calls on each context switch.
+rtos-trace = { version = "0.2.0", optional = true }
+zerocopy = { version = "0.8.52", default-features = false, features = [
+    "derive",
+] }
+
+[profile.dev]
+# Rust debug is too slow.
+# For debug builds always builds with some optimization
+incremental = true
+debug = 2
+opt-level = "s"
+
+[profile.dev.package."*"]
+# Dependencies (HAL, radio, graphics, etc.) are performance critical.
+opt-level = 3
+
+[profile.release]
+codegen-units = 1        # LLVM can perform better optimizations using a single thread
+debug-assertions = false
+incremental = false
+lto = 'fat'
+opt-level = 3
+overflow-checks = false
+panic = "abort"
+
+[profile.release.package."*"]
+# Dependencies (HAL, radio, graphics, etc.) are performance critical.
+opt-level = 3
+
+[package.metadata.docs.rs]
+# docs.rs configuration: build docs for a single embedded target with
+# a representative feature set. Adjust if you want different chips in docs.
+targets = ["riscv32imc-unknown-none-elf"]
+features = ["esp32c3", "println"]
