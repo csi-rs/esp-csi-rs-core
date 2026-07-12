@@ -97,7 +97,7 @@ esp32c3 = [
     "esp-rtos/esp32c3",
 ]
 
-## Support for the ESP32-C6 (WiFi 6)
+## Support for the ESP32-C6
 esp32c6 = [
     "esp-hal/esp32c6",
     "esp-hal/rt",
