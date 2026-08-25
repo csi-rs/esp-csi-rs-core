@@ -108,6 +108,14 @@ pub fn auto_log_backend_label() -> &'static str {
 /// Capping to 128 keeps every line at ~475B and lets sniffer hit the
 /// same PPS as a peripheral seeing only one PHY type.
 ///
+/// Scope is deliberately EspCsiTool-ONLY, and this is NOT a general throughput knob. Truncating a
+/// payload discards subcarriers the radio already spent airtime capturing, and an arbitrary cap cuts
+/// mid-LTF-field. The right way to shorten a CSI line is to stop ACQUIRING the fields you do not
+/// want — `CsiConfig`'s per-LTF flags, driven from a CLI as `set-csi --htltf=off --stbc-htltf=off`.
+/// Measured on an ESP32 at 115200, that beat truncating to the same 128 bytes: 23.9 vs 21.0 CSI/s
+/// delivered, and 506 vs 446 frames captured, because the radio does less work per frame. This cap
+/// exists only to reproduce ESP32-CSI-Tool's column-25/26 semantics for collectors expecting them.
+///
 /// Default 0 = no cap (emit full `csi_data`).
 static CSI_TOOL_EMIT_CAP: portable_atomic::AtomicU16 = portable_atomic::AtomicU16::new(0);
 
@@ -115,8 +123,8 @@ static CSI_TOOL_EMIT_CAP: portable_atomic::AtomicU16 = portable_atomic::AtomicU1
 ///
 /// Pass `0` to disable the cap (emit all captured samples — the default).
 /// Pass `128` to match ESP32-CSI-Tool's `CONFIG_SHOULD_COLLECT_ONLY_LLTF`
-/// behavior, which produces uniform ~475B lines in sniffer mode and keeps
-/// PPS at the UART ceiling regardless of the captured PHY type.
+/// behavior. See [`CSI_TOOL_EMIT_CAP`] for why this is not the knob to reach
+/// for when the goal is throughput.
 pub fn set_csi_tool_emit_cap(cap: u16) {
     CSI_TOOL_EMIT_CAP.store(cap, Ordering::Relaxed);
 }
@@ -217,8 +225,40 @@ fn auto_usb_sof_seen() -> bool {
         feature = "esp32s3"
     ))]
     {
+        // CLEAR the latch, then watch for a FRESH frame — the same probe the CLI console uses
+        // (`cli::serial::usb_sof_seen`), for the reason documented there: `INT_RAW` latches and is
+        // only cleared by writing `INT_CLR`, so reading it directly answers "has this board EVER
+        // seen a host" rather than "is a host attached now". That made this a coin flip in both
+        // directions — false when it ran before the first SOF arrived (a USB board logging to its
+        // UART pins, which is how a whole fleet went silent on 2026-08-20 while attaching,
+        // verifying and reporting its rate) and sticky-true long after a host went away.
+        //
+        // A budget rather than a single sample, because SOF is a 1 ms heartbeat: an attached host
+        // answers almost immediately, and only a genuinely UART-only rig spends the whole window.
+        // 300 ms matches the CLI's, so the console and the logger cannot reach opposite conclusions
+        // about the same board — which was the actual defect, not the choice itself.
         const SOF_INT_MASK: u32 = 0b10;
-        unsafe { (USB_DEVICE_INT_RAW.read_volatile() & SOF_INT_MASK) != 0 }
+        const INT_CLR_OFFSET: usize = 0x0c;
+        const BUDGET_MS: u32 = 300;
+
+        let int_raw = USB_DEVICE_INT_RAW as *mut u32;
+        unsafe {
+            int_raw
+                .byte_add(INT_CLR_OFFSET)
+                .write_volatile(SOF_INT_MASK)
+        };
+        let delay = esp_hal::delay::Delay::new();
+        let mut waited = 0u32;
+        loop {
+            if unsafe { USB_DEVICE_INT_RAW.read_volatile() & SOF_INT_MASK } != 0 {
+                break true;
+            }
+            if waited >= BUDGET_MS {
+                break false;
+            }
+            delay.delay_millis(1);
+            waited += 1;
+        }
     }
 }
 
@@ -265,9 +305,29 @@ mod log_impl {
     }
 }
 
+/// The defmt `#[global_logger]`, registered whenever defmt is on and SOME transport exists.
+///
+/// The condition used to be `any(async-print, auto)`, which silently excluded the one transport
+/// defmt is most worth having on: **`uart`**. A `defmt` + `uart` build compiled and then failed to
+/// link with `undefined symbol: _defmt_acquire` / `_defmt_release` / `_defmt_write` — the three
+/// symbols a `#[global_logger]` provides — because no logger was registered at all.
+///
+/// That combination is not exotic. It is the ONLY one available on ESP32 and ESP32-S2, which have
+/// no USB-Serial-JTAG peripheral, so their console is UART0 and their log transport is UART0. defmt
+/// exists to make a slow link carry more, and a slow link is exactly what those parts have; gating
+/// its logger on the fast transports inverted that.
+///
+/// Note the body did not need changing: `do_write` already has a `uart` arm for the async path and
+/// falls back to `esp_println::Printer::write_bytes` for the blocking one. Only the gate around it
+/// was narrower than the code inside it.
 #[cfg(all(
     feature = "defmt",
-    any(feature = "async-print", feature = "auto"),
+    any(
+        feature = "async-print",
+        feature = "auto",
+        feature = "uart",
+        feature = "jtag-serial"
+    ),
     not(feature = "external-defmt-logger")
 ))]
 mod defmt_impl {
@@ -469,6 +529,21 @@ mod logging_impl {
     }
 }
 
+/// Log a pre-formatted line through this crate's configured backend.
+///
+/// [`log_ln!`] resolves its `#[cfg(feature = ...)]` gates against the **calling**
+/// crate, so an out-of-tree consumer that does not happen to replicate this
+/// crate's feature names gets an empty expansion and silently logs nothing. That
+/// is a trap: the call compiles, the message never appears, and the only symptom
+/// is missing diagnostics exactly when they are needed.
+///
+/// This function resolves those gates here instead, so out-of-tree code (an
+/// emitter that owns the radio directly, for instance) can reach the same
+/// backend. Callers format their own message.
+pub fn log_line(msg: &str) {
+    crate::log_ln!("{}", msg);
+}
+
 /// Logging macro that routes to `println!`/`defmt` based on features.
 ///
 /// Uses async logging when active (`async-print` or auto-selected JTAG).
@@ -599,7 +674,7 @@ pub fn log_csi(packet: CSIDataPacket) {
             return;
         }
     }
-    #[cfg(not(feature = "async-print"))]
+    #[cfg(any(not(feature = "async-print"), feature = "auto"))]
     {
         #[cfg(any(feature = "uart", feature = "jtag-serial", feature = "auto"))]
         {
@@ -643,24 +718,59 @@ pub fn init_logger(spawner: embassy_executor::Spawner, log_mode: LogMode) {
     // writes inline). Enable the publish gate up front so it starts running.
     crate::set_csi_logging_enabled(true);
 
+    // Under `auto` this follows the TRANSPORT, never the feature flag.
+    //
+    // `async-print` used to force this true, which is the bug: `auto` decides the console at boot
+    // from a one-shot USB-SOF read, and a board that lands on UART was then run through the ASYNC
+    // backend — a 32-slot drop-newest channel against ~11 KB/s of UART, versus the ~48 KB/s a
+    // collector produces. Measured on the bench 2026-08-20 with an emitter running: `RX Total
+    // Packets: 897`, `Log Dropped Pkts: 801`, and **zero bytes** on the port in both `serialized`
+    // and `array-list`. The board attached, verified, answered every command and reported its rate,
+    // because the CLI console is on USB either way — it simply never delivered CSI. Four boards
+    // re-plugged at once all landed there, and a whole fleet went silent while looking healthy.
+    //
+    // The pairing this restores is the one this function's own doc comment already described: async
+    // on USB-Serial-JTAG, where the link is fast and drop-newest is a sane overflow rule; sync on
+    // UART, where writes block and a slow capture beats a silent one. `async-print` now means "async
+    // where the transport suits it", not "async regardless".
+    //
+    // `auto` deliberately stays a runtime choice — a board may be reached over either console, and
+    // pinning the transport at build time would take that away.
     let async_active = {
-        #[cfg(feature = "async-print")]
-        {
-            true
-        }
-        #[cfg(all(not(feature = "async-print"), feature = "auto", not(feature = "esp32")))]
+        #[cfg(all(feature = "auto", not(feature = "esp32")))]
         {
             auto_usb_sof_seen()
         }
-        #[cfg(any(
-            all(not(feature = "async-print"), feature = "auto", feature = "esp32"),
-            all(not(feature = "async-print"), not(feature = "auto"))
+        #[cfg(all(
+            any(not(feature = "auto"), feature = "esp32"),
+            feature = "async-print"
+        ))]
+        {
+            true
+        }
+        #[cfg(all(
+            any(not(feature = "auto"), feature = "esp32"),
+            not(feature = "async-print")
         ))]
         {
             false
         }
     };
     ASYNC_LOG_ACTIVE.store(async_active, Ordering::Relaxed);
+
+    // Name the branch ONCE at boot. Which side of this `auto` selection a board lands on is
+    // decided by a one-shot USB-SOF register read whose outcome depends on enumeration timing —
+    // and the two sides have opposite overflow behavior (async = drop-newest on a 32-slot
+    // channel; sync = a blocking serial write INSIDE the radio CSI callback). Two identical
+    // boards booting into opposite modes was invisible until this line existed.
+    esp_println::println!(
+        "log backend: {}",
+        if async_active {
+            "async (drop-newest on overflow)"
+        } else {
+            "sync (blocking writes in the CSI callback)"
+        }
+    );
 
     #[cfg(any(feature = "async-print", feature = "auto"))]
     if async_active {
@@ -751,7 +861,7 @@ async fn write_serialized_packet_async(
     }
 }
 
-#[cfg(not(feature = "async-print"))]
+#[cfg(any(not(feature = "async-print"), feature = "auto"))]
 fn write_serialized_packet_sync(packet: CSIDataPacket) {
     const PACKET_MAX_SIZE: usize = CSIDataPacket::POSTCARD_MAX_SIZE;
     const PACKET_BUF_SIZE: usize = PACKET_MAX_SIZE + (PACKET_MAX_SIZE / 254) + 1;
@@ -788,6 +898,13 @@ async fn write_text_array_packet_async(
     // identical across transports and modes.
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!(ASYNC_LOG_SCRATCH) };
     let n = format_array_list_into(&packet, scratch);
+    // `0` means the formatter refused the line rather than truncate it (see
+    // `format_array_list_into`). Count it as a log drop and emit nothing — a partial row is worse
+    // than a missing one, because a host cannot tell it from real data.
+    if n == 0 {
+        record_log_drop();
+        return Ok(());
+    }
     driver.write(&scratch[..n]).await.map_err(|_| ())?;
     Ok(())
 }
@@ -821,7 +938,14 @@ impl core::fmt::Write for SliceWriter<'_> {
 /// trailing `\n` (and an optional preceding `\r`) is trimmed because
 /// `defmt::println!` appends its own line terminator — otherwise every decoded
 /// line would be followed by a blank one.
-#[cfg(all(not(feature = "async-print"), feature = "defmt"))]
+// Gated to match its CALLERS, which are `#[cfg(feature = "defmt")]`.
+//
+// This was `all(not(async-print), defmt)` while every call site was `defmt` alone, so a build with
+// both features referenced a function that did not exist — `defmt` + `async-print` has never
+// compiled, which is the whole reason there was "no way to flash defmt firmware". A definition whose
+// gate is narrower than its callers' is not a configuration to choose between; it is a build that
+// cannot exist.
+#[cfg(feature = "defmt")]
 fn defmt_emit_line(bytes: &[u8]) {
     let mut end = bytes.len();
     if end > 0 && bytes[end - 1] == b'\n' {
@@ -894,21 +1018,71 @@ fn format_array_list_into(packet: &CSIDataPacket, buf: &mut [u8]) -> usize {
     }
     field!(packet.sig_len);
     field!(packet.csi_data_len);
+    // Every captured sample is emitted. There is deliberately no truncation knob here: discarding
+    // subcarriers the radio already spent airtime capturing is the wrong trade, and an arbitrary cap
+    // would cut mid-LTF-field, which is not a meaningful measurement. To shorten a line, stop
+    // ACQUIRING the fields you do not want — `set-csi --htltf=off --stbc-htltf=off`. See
+    // `CSI_TOOL_EMIT_CAP`.
+    let emit_len = packet.csi_data.len();
 
     let _ = w.write_str("[");
-    let data_len = packet.csi_data.len();
-    for (i, val) in packet.csi_data.iter().enumerate() {
-        if i + 1 < data_len {
-            let _ = write!(&mut w, "{},", val);
+    // Direct decimal encoding rather than `write!("{},")` per value, using the same `write_i8_sep`
+    // the EspCsiTool formatter already used.
+    //
+    // This is throughput-NEUTRAL and is not here for speed. A/B measured on an ESP32 at 400 Hz
+    // offered, three 20 s trials each, delivered CSI/s: 8.98 (core::fmt) vs 8.86 (this) at 115200,
+    // and 63.00 vs 63.79 at 921600 — inside run-to-run noise at both bauds. The formatting cost is
+    // a few ms against a ~100 ms blocking UART write per line, so it was never the bottleneck; an
+    // earlier claim in this file that it was the 921600 ceiling was wrong, and the 35%-of-line-rate
+    // figure behind it was capture-rate variance, not formatting.
+    //
+    // Kept for two reasons that do hold: it keeps `core::fmt` — whose integer path leans on
+    // software division on the LX6, inside the Wi-Fi RX callback — off this path, and it makes the
+    // output length predictable enough to bounds-check ONCE up front, which is what lets the
+    // formatter refuse an over-long line instead of emitting a truncated one (see below).
+    //
+    // Bounds are checked ONCE for the whole body instead of per value: `write_i8_sep` writes up to
+    // 5 bytes and indexes `buf` directly, so a per-value check is the only thing standing between a
+    // long payload and a panic. Reserve the closing `],` + MAC + `]\r\n` too.
+    const TAIL_RESERVE: usize = 2 + 17 + 3;
+    if w.pos + emit_len * 5 + TAIL_RESERVE > w.buf.len() {
+        // Refuse to emit rather than emit a prefix. `SliceWriter` returns `Err` on overflow and
+        // every `write!` here discards it, so an over-long line used to be written up to the byte
+        // the buffer ran out at and shipped headerless-tail — no `]`, no MAC, no `\r\n`. A host
+        // parser sees that as a corrupt row of real data, which is far worse than a counted drop.
+        return 0;
+    }
+    for (i, &val) in packet.csi_data.iter().take(emit_len).enumerate() {
+        let sep = if i + 1 < emit_len { b',' } else { 0 };
+        if sep == 0 {
+            // Last value: no trailing separator. Write with a placeholder and rewind over it.
+            write_i8_sep(w.buf, &mut w.pos, val, b',');
+            w.pos -= 1;
         } else {
-            let _ = write!(&mut w, "{}", val);
+            write_i8_sep(w.buf, &mut w.pos, val, sep);
         }
     }
-    let _ = w.write_str("]]\r\n");
+    // The transmission's IDENTITY, appended after the payload rather than woven into the header.
+    //
+    // Without it an array-list capture cannot be joined across receivers on the packet — the pool
+    // pairs on `(mac, frame_seq)`, and `frame_seq` is already the leading `sequence_number` field, so
+    // `mac` was the only thing missing. A capture lacking it falls back to pairing by arrival time,
+    // which on a measured capture put "simultaneous" pairs 482 ms apart.
+    //
+    // A TAIL, deliberately: the header's field positions differ per chip and a host parses the parts
+    // it needs from both ends (the leading eight are common, `csi_data_len` is last before the
+    // payload). Inserting identity into the header would shift one of those anchors on every part.
+    // Appending leaves both intact and leaves a reader of the old format still able to read the new
+    // one, which matters while a fleet runs mixed builds.
+    let _ = w.write_str("],");
+    for (i, b) in packet.mac.iter().enumerate() {
+        let _ = write!(&mut w, "{}{:02x}", if i == 0 { "" } else { ":" }, b);
+    }
+    let _ = w.write_str("]\r\n");
     w.pos
 }
 
-#[cfg(not(feature = "async-print"))]
+#[cfg(any(not(feature = "async-print"), feature = "auto"))]
 fn write_text_array_packet_sync(packet: CSIDataPacket) {
     // Single-consumer scratch: the sync write path runs only from the WiFi
     // callback (`node_task`), one packet at a time. A static avoids putting a
@@ -916,6 +1090,11 @@ fn write_text_array_packet_sync(packet: CSIDataPacket) {
     static mut SCRATCH: [u8; 3328] = [0u8; 3328];
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!(SCRATCH) };
     let _n = format_array_list_into(&packet, scratch);
+    // See the async path: `0` is a refused line, not an empty one.
+    if _n == 0 {
+        record_log_drop();
+        return;
+    }
 
     // Emit the formatted line in one bulk write, mirroring the sync
     // `write_csi_tool_packet` path. On ESP32/UART the direct FIFO writer
@@ -951,6 +1130,15 @@ const ESP_CSI_TOOL_HEADER: &str = "type,role,mac,rssi,rate,sig_mode,mcs,bandwidt
 /// Caller must ensure at least 5 bytes free (worst case `-128 ` = 5 bytes).
 #[inline(always)]
 fn write_i8_space(buf: &mut [u8], offset: &mut usize, val: i8) {
+    write_i8_sep(buf, offset, val, b' ');
+}
+
+/// As [`write_i8_space`], but with a caller-chosen separator byte, so the
+/// `ArrayList` formatter can share the same encoder with a `,`.
+///
+/// Caller must ensure at least 5 bytes free (worst case `-128,` = 5 bytes).
+#[inline(always)]
+fn write_i8_sep(buf: &mut [u8], offset: &mut usize, val: i8, sep: u8) {
     let mut o = *offset;
     let mut n: i16 = val as i16;
     if n < 0 {
@@ -972,7 +1160,7 @@ fn write_i8_space(buf: &mut [u8], offset: &mut usize, val: i8) {
         buf[o] = b'0' + n as u8;
         o += 1;
     }
-    buf[o] = b' ';
+    buf[o] = sep;
     *offset = o + 1;
 }
 
@@ -1291,18 +1479,18 @@ fn uart0_write_bytes_fast(bytes: &[u8]) {
 
 /// Cumulative microseconds spent formatting CSI packets on the sync write
 /// path. Read by examples to compute the format vs UART-write split.
-#[cfg(not(feature = "async-print"))]
+#[cfg(any(not(feature = "async-print"), feature = "auto"))]
 pub static SYNC_FORMAT_US: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 /// Cumulative microseconds spent writing formatted CSI bytes to the
 /// transport on the sync write path.
-#[cfg(not(feature = "async-print"))]
+#[cfg(any(not(feature = "async-print"), feature = "auto"))]
 pub static SYNC_WRITE_US: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 /// Number of CSI packets emitted on the sync write path; the divisor used
 /// with [`SYNC_FORMAT_US`] / [`SYNC_WRITE_US`] for per-packet averages.
-#[cfg(not(feature = "async-print"))]
+#[cfg(any(not(feature = "async-print"), feature = "auto"))]
 pub static SYNC_PKT_COUNT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
-#[cfg(not(feature = "async-print"))]
+#[cfg(any(not(feature = "async-print"), feature = "auto"))]
 fn write_csi_tool_packet_sync(packet: CSIDataPacket) {
     // Format + spin UART0 directly in the WiFi callback context. This is the
     // hot path that achieves baud-bound PPS — moving the spin out to a
@@ -1491,7 +1679,7 @@ async fn write_text_packet_async(packet: CSIDataPacket, driver: &mut LogOutput) 
     Ok(())
 }
 
-#[cfg(not(feature = "async-print"))]
+#[cfg(any(not(feature = "async-print"), feature = "auto"))]
 fn write_text_packet_sync(packet: CSIDataPacket) {
     if let Some(dt) = &packet.date_time {
         log_ln!(
@@ -1649,6 +1837,21 @@ pub async fn logger_backend(mut driver: LogOutput) {
             }
         }
     }
+}
+
+/// Record one CSI line the log path refused to emit.
+///
+/// Mirrors the cfg shape of [`get_log_packet_drops`] / [`reset_global_log_drops`] so a build without
+/// the async channel (where `LOG_DROPPED_PACKETS` does not exist) still compiles — the drop is then
+/// simply not counted, same as every other statistic in such a build.
+#[allow(unused)]
+pub(crate) fn record_log_drop() {
+    #[cfg(all(
+        any(feature = "uart", feature = "jtag-serial", feature = "auto"),
+        any(feature = "async-print", feature = "auto"),
+        feature = "statistics"
+    ))]
+    LOG_DROPPED_PACKETS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Reset the global dropped-log counter (statistics feature only).

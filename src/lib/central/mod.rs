@@ -7,9 +7,14 @@
 //! [`sniffer`](self::sniffer) module is a placeholder for future
 //! central-side sniffer logic.
 
-/// Self-contained softAP CSI collector: start an access point + minimal DHCP
-/// server so a Wi-Fi station node can associate and generate CSI-bearing traffic.
-pub mod ap;
+// `ap` and `sta` are RE-EXPORTED from `collector`, not duplicated here.
+//
+// The emitter/collector refactor moved both modules wholesale and edited them on the way. Restoring
+// the pre-refactor copies alongside would leave two versions of the same softAP and station code to
+// keep in step, and they would drift — so `central` is a compatibility facade over the live ones
+// plus the ESP-NOW drivers, which have no counterpart under `collector`.
+pub use crate::collector::{ap, sta};
+
 /// Central-side ESP-NOW driver: latency-balanced control/reply exchange
 /// with a peripheral that supplies the CSI source frames.
 pub mod esp_now;
@@ -18,5 +23,3 @@ pub mod esp_now;
 pub mod esp_now_fast;
 /// Reserved for future central-side promiscuous sniffer logic. Currently empty.
 pub mod sniffer;
-/// Wi-Fi station mode: associate to an AP and process CSI from received frames.
-pub mod sta;

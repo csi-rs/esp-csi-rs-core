@@ -79,7 +79,12 @@ pub(crate) fn seq_drop_detection_enabled() -> bool {
     SEQ_DROP_DETECTION_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Reset the statistics counters. Called by `reset_globals` between runs.
+/// Reset the statistics counters. Called only by `stats_begin_run`, at the start of a run.
+///
+/// Gated on `statistics` because its sole caller is: moving the reset out of `reset_globals` (which
+/// is unconditional) left this with zero callers when the feature is off, and `cargo hack
+/// --each-feature` builds exactly that combination.
+#[cfg(feature = "statistics")]
 pub(crate) fn reset() {
     #[cfg(feature = "statistics")]
     {
@@ -129,6 +134,63 @@ pub fn get_pps_rx() -> u64 {
         return total_packets;
     }
     total_packets / elapsed_secs
+}
+
+/// Record one transmitted frame.
+///
+/// Called by the emitter's inject loop for each frame the driver accepted, so
+/// TX counters reflect frames actually handed to the radio rather than loop
+/// iterations.
+#[cfg(feature = "statistics")]
+pub(crate) fn record_tx() {
+    STATS.tx_count.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one transmitted frame from an **out-of-tree emitter**.
+///
+/// An emitter that owns the radio directly (rather than running through
+/// [`crate::emitter::run_emitter`]) has no other way to reach the TX counters, so
+/// its frames would be invisible to `get_total_tx_packets` / `get_pps_tx` — the
+/// exact counters someone reaches for when a collector reports nothing. Call this
+/// once per frame the driver accepted.
+#[cfg(feature = "statistics")]
+pub fn record_emitter_tx() {
+    record_tx();
+}
+
+/// Record one received CSI report from an **out-of-tree collector**.
+///
+/// The HE20 path registers its own CSI callback and never enters
+/// `capture_csi_info`, so until this existed an HE20 collector's `show-stats`
+/// reported `RX Total Packets: 0` however many frames it forwarded — the
+/// firmware's receive accounting was simply dead on the path production runs.
+#[cfg(feature = "statistics")]
+pub fn record_collector_rx() {
+    STATS.rx_count.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one CSI report an out-of-tree collector DROPPED (payload over the
+/// wire cap, filtered, or otherwise not forwarded). Sibling of
+/// [`record_collector_rx`], same reasoning.
+#[cfg(feature = "statistics")]
+pub fn record_collector_rx_drop() {
+    STATS.rx_drop_count.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Reset every counter and stamp the capture start, at the START of a run.
+///
+/// Called by `CSINode::run_inner` for the in-tree roles and directly by the out-of-tree HE20 run
+/// loop, which enters neither `run_inner` nor `run_process_csi_packet` and so had no counter reset
+/// and no start time to divide `pps` by.
+///
+/// This is the ONLY place counters are cleared. `reset_globals` used to also clear them, but it runs
+/// at the end of a run, so it wiped the numbers a user was about to read — see the note there.
+#[cfg(feature = "statistics")]
+pub fn stats_begin_run() {
+    reset();
+    STATS
+        .capture_start_time
+        .store(Instant::now().as_ticks(), Ordering::Relaxed);
 }
 
 /// Packets per second transmitted since capture start (statistics feature).
